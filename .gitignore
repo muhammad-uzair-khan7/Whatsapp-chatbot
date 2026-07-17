@@ -1,0 +1,18 @@
+# Cache and Environment Folders
+__pycache__/
+_VECTORSTORE_PATH/
+.venv/
+.env
+
+# SQLite Databases & Metadata
+conversations.db
+conversations.db-shm
+conversations.db-wal
+
+# Credentials & Secrets
+credentials.json
+
+# Local Testing Files
+testing.ipynb
+test_image.jpeg
+.ipynb_checkpoints/

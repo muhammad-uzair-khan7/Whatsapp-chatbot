@@ -1,0 +1,25 @@
+1. The Core Setup & Flow (Our Logistics)
+"Look, we’re located right in Phase 6 DHA on Nishat, right next to Meezan Bank. It’s a busy spot, so parking gets tight. From Friday to Sunday evenings, I pay for a valet service starting at 7 PM because our customers hate hunting for spots.
+
+We open at 8 AM daily. Monday through Thursday, we close at midnight, but the weekend crowd rolls late, so we push it to 2 AM on Friday, Saturday, and Sunday. If you're building the bot, make sure it stops taking kitchen orders 30 minutes before close—my chefs need time to clean down the stations.
+
+For the remote workers: we love them, we have great Wi-Fi, and we put plenty of power sockets near the high-stool wall counter. But on weekend nights after 6 PM, the floor gets packed with families and dates. We cannot have someone holding a 4-person table for three hours with a single cold brew. So, the bot needs to politely tell people: Laptops are weekdays only, or daytime on weekends."
+
+2. The Kitchen & The Pricing (The Menu)
+"When someone asks about the menu, don't let the bot just guess the prices. Our Espresso is 450 PKR, a Cappuccino is 620, and our biggest seller—the Spanish Latte—is 680.
+
+If someone has a dairy allergy, tell them we have Oat and Almond milk, but it’s an extra 150 PKR because importing alternative milk right now is expensive. For food, our Avocado Toast (1,250 PKR) and Grilled Chicken Sandwich (1,450 PKR) take about 12 to 15 minutes to prep fresh. Oh, and a huge detail: our kitchen handles walnuts and almonds. If a customer tells the bot they have a severe nut allergy, the bot must tell them to inform their server immediately. I don't want to take any risks.
+
+Also, taxes trip people up. Our menu prices are exclusive of tax. So when they get the bill, there's a 13% Sindh Sales Tax (SST) added, plus that mandatory 1 PKR FBR POS fee. Make sure the bot makes this clear so there are no surprises at the register."
+
+3. Payments & Operations (How We Handle Money)
+"We take cash, cards, and digital wallets like Alfa, Nayapay, or SadaPay via QR codes.
+
+Here's a operational headache you need to program for: card machines time out sometimes. The bank takes the money from the customer's account, but our machine prints a 'Failed' slip. It’s awkward. Our policy is that the customer has to pay via cash or another card, and we give them the official failed merchant slip so they can get a reversal from their bank. Tell the bot to be incredibly polite but firm about this if someone complains about a double deduction."
+
+4. Deliveries, Birthdays, & Content Creators
+"We don’t have our own riders—handling logistics in Karachi is a nightmare. We are exclusively on Foodpanda, so if they want delivery, send them there. But we do do Car Dine-In. They can just park outside, flash their lights, and a server will run out with a QR menu. They can pay card or cash from their window.
+
+Now, about birthdays and TikTokers: people love bringing external cakes. We allow it, but we charge a 500 PKR cake-cutting fee to cover the plates, service, and cleanup.
+
+For photography: smartphones are totally fine. But if a clothing brand or an influencer shows up with a DSLR, a ring light, and three bags of outfits without telling us, they disrupt the vibe. The bot needs to tell them that professional shoots are only allowed before opening hours (6 AM to 8:30 AM) on Mondays or Tuesdays, and it costs 15,000 PKR an hour."
