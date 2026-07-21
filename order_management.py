@@ -77,6 +77,8 @@ def create_new_order(name: str, items: list[str], source: str = "WhatsApp") -> d
             if isinstance(detail, dict):
                 return {"success": False, "error": detail.get("message"), "shortages": detail.get("shortages", [])}
             return {"success": False, "error": str(detail)}
+        if resp.status_code == 422:
+            return {"success": False, "error": f"Invalid order request: {resp.json().get('detail')}"}
         resp.raise_for_status()
         data = resp.json()
         data["success"] = True

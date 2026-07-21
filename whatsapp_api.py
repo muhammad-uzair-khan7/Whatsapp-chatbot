@@ -1,6 +1,7 @@
 from pywa import WhatsApp, filters, types
 from pywa.types import MessageType
 from dotenv import load_dotenv
+import time
 import os
 import base64
 from openai import OpenAI
@@ -8,7 +9,7 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_openai import ChatOpenAI
 from langchain_classic.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.messages import BaseMessage, AIMessage, HumanMessage
-from langchain_core.tools import tool
+from langchain_core.messages import ToolMessage
 from langgraph.graph.message import add_messages
 from langgraph.graph import StateGraph, START, END
 
@@ -34,7 +35,7 @@ app= FastAPI(title="WhatsApp API Server")
 wa = WhatsApp(phone_id=PHONENUMBER_ID, token=ACCESS_TOKEN, app_id=APP_ID, app_secret=APP_SECRET, callback_url="https://overvaliant-waneta-optometrical.ngrok-free.dev", server=app, webhook_endpoint="/whatsapp/webhook", verify_token=VERIFY_TOKEN)
 
 def get_chat_model():
-    chat_model= ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0.5, api_key=GOOGLE_GENERATIVE_AI)
+    chat_model= ChatGoogleGenerativeAI(model="gemini-3-flash-preview", temperature=0.5, api_key=GOOGLE_GENERATIVE_AI)
     return chat_model
 
 # State Class For ChatBot    
@@ -44,6 +45,16 @@ class BotState(TypedDict):
     wa_id: int
     classifier: Literal["order_management", "customer_query", "customer_complaint"]
     response_to_user: str
+    flow_active: bool
+
+# ---------------- Shared helpers ----------------
+REROUTE_SENTINEL = "REROUTE"
+ 
+REROUTE_INSTRUCTION = (
+    "\n\nIMPORTANT: If the user's latest message is clearly unrelated to your current task "
+    f"(e.g. they ask something from a totally different topic), respond with EXACTLY the single "
+    f"word {REROUTE_SENTINEL} and nothing else. Do not use this for anything else."
+)
 
 def extract_text(ai_message):
     content = ai_message.content
@@ -85,6 +96,7 @@ def extract_text_message(message: types.Message):
     elif message.type== MessageType.IMAGE:
         image_bytes= message.image.get_bytes()
         base64_image= base64.b64encode(image_bytes).decode('utd-8')
+        mime_type= getattr(message.image, "mime_type", None) or "image/jpeg"
         caption= message.image.caption or ""
         try:
             response = openrouter_model.chat.completions.create(
@@ -94,7 +106,7 @@ def extract_text_message(message: types.Message):
                         "role": "user",
                         "content": [
                             {"type": "text", "text": "Extract all text from this image or describe the image clearly so a search engine can index it. If it's not text, analzye the iamge and tell describe what it is."},
-                            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}}
+                            {"type": "image_url", "image_url": {"url": f"data:image/{mime_type};base64,{base64_image}"}}
                         ]
                     }
                 ]
@@ -194,8 +206,31 @@ def customer_query_agent(state:BotState):
     answer= response["answer"]
     return {
         "messages": [AIMessage(content=answer)],
-        "response_to_user": answer
+        "response_to_user": answer,
+        "flow_active": False
     }
+
+# ---------Agent history sanitizer ------------
+def sanitize_history_for_agent(history: list[BaseMessage]) -> list[BaseMessage]:
+    """
+    Remove tool-call AIMessages and their corresponding ToolMessage results
+    from history before handing it to a different agent. Prevents Gemini
+    from seeing a function-call turn for a tool that isn't bound in the
+    current agent's tool set (e.g. create_order showing up mid-complaint-flow).
+    """
+    cleaned: list[BaseMessage] = []
+    skip_tool_results = False
+    for msg in history:
+        if isinstance(msg, AIMessage) and getattr(msg, "tool_calls", None):
+            skip_tool_results = True
+            continue
+        if isinstance(msg, ToolMessage):
+            if skip_tool_results:
+                continue
+        else:
+            skip_tool_results = False
+        cleaned.append(msg)
+    return cleaned
 
 #-------------Agent 2-----------------
 #-----------Tools--------------
@@ -203,6 +238,7 @@ from order_management import create_order, check_order_status, see_item_stock
 model= get_chat_model()
 _order_tools = [create_order, check_order_status, see_item_stock]
 order_tool_based_model= model.bind_tools(tools=_order_tools)
+_ORDER_TOOLS_BY_NAMES= {"create_order":create_order, "check_order_status": check_order_status, "see_item_stock": see_item_stock}
 def order_management_agent(state: BotState):
     prompt= ChatPromptTemplate.from_messages(
         [('system', """You are a cafe receptionist who create orders for customer over online messages and forwards order status with customers.
@@ -213,93 +249,49 @@ def order_management_agent(state: BotState):
         * To start with order creation you first need to get the name of the customer
         * After you get the name, you have to get the phone number and address of the customer.
         * Once, these three things are ready, ask for an active email.
-        * After getting all the details, create an order using 'create_order' tool, to post an order into the system."""),
+        * After getting all the details, create an order using 'create_order' tool, to post an order into the system.""" + REROUTE_INSTRUCTION,),
         MessagesPlaceholder(variable_name="chat_history"),
         ("human", "{input}")]
     )
     order_llm= prompt | order_tool_based_model
-    history= state.get("messages", [])
+    history= sanitize_history_for_agent(state.get("messages", [])[:-1])
     current_user_message= state["incoming_message"]
     response= order_llm.invoke({"chat_history": history, "input": current_user_message})
+    new_message: list[BaseMessage]= [response]
+    tool_result: list[str] = []
+    while response.tool_calls:
+        tool_messages= []
+        for call in response.tool_calls:
+            tool_fn= _ORDER_TOOLS_BY_NAMES[call["name"]]
+            tool_result= tool_fn.invoke(call["args"])
+            tool_messages.append(ToolMessage(content=str(tool_result), tool_call_id=call["id"]))
+        new_message.extend(tool_messages)
+        response= order_tool_based_model.invoke(history + [HumanMessage(content=current_user_message)] + new_message)
+        new_message.append(response)
+    
+
     print("RAW LLM RESPONSE:", response, flush=True)
-
-    # If the model suggested a tool/function call, execute the tool and use its result as the reply.
-    tool_result_text = None
-    try:
-        # LangChain/Model responses may expose tool calls in different places depending on model wrapper.
-        # Check common shapes: response.get("tool_calls"), response.get("additional_kwargs") with function_call,
-        # or a top-level 'tool_call' key. Try multiple fallbacks.
-        tool_calls = None
-        if isinstance(response, dict):
-            tool_calls = response.get("tool_calls") or response.get("tool_call")
-            additional = response.get("additional_kwargs") or {}
-            func_call = additional.get("function_call") if isinstance(additional, dict) else None
-            if not tool_calls and func_call:
-                tool_calls = [func_call]
-        else:
-            # response might be an object with attributes
-            tool_calls = getattr(response, "tool_calls", None) or getattr(response, "tool_call", None)
-            additional = getattr(response, "additional_kwargs", {})
-            func_call = additional.get("function_call") if isinstance(additional, dict) else None
-            if not tool_calls and func_call:
-                tool_calls = [func_call]
-
-        if tool_calls:
-            # Only handle the first tool call for simplicity
-            tc = tool_calls[0]
-            # tc may be a dict with 'name' and 'args' JSON-string, or an object with similar attrs
-            if isinstance(tc, dict):
-                tool_name = tc.get("name")
-                args = tc.get("args")
-            else:
-                tool_name = getattr(tc, "name", None)
-                args = getattr(tc, "args", None)
-
-            # args may be a JSON string or a dict
-            import json
-            parsed_args = {}
-            if args:
-                if isinstance(args, str):
-                    try:
-                        parsed_args = json.loads(args)
-                    except Exception:
-                        # fallback: try to eval (not ideal), but keep safe — treat as empty
-                        parsed_args = {}
-                elif isinstance(args, dict):
-                    parsed_args = args
-
-            # Map tool name to the actual callable we imported above
-            tool_map = {fn.__name__: fn for fn in _order_tools}
-            tool_callable = tool_map.get(tool_name)
-            if tool_callable:
-                # Call the tool with parsed args (assume kwargs)
-                try:
-                    tool_result = tool_callable(**parsed_args)
-                    # If tool returns non-str, convert
-                    tool_result_text = str(tool_result)
-                except Exception as e:
-                    tool_result_text = f"(tool execution error: {e})"
-            else:
-                tool_result_text = f"(no tool available named {tool_name})"
-    except Exception:
-        # Don't let tool-exec debug stop normal operation
-        import traceback
-        traceback.print_exc()
-
-    if tool_result_text:
-        answer = tool_result_text
-    else:
-        answer= extract_text(response)
-
+    answer= extract_text(response).strip()
+    if answer == REROUTE_SENTINEL:
+        return {
+            "messages": [],
+            "response_to_user": "",
+            "flow_active": False
+        }
+    task_complete= any(r.startswith("Order created") or r.startswith("Order #") for r in tool_result)
     return {
-        "messages": [AIMessage(content=answer)],
-        "response_to_user": answer
+        "messages": new_message,
+        "response_to_user": answer,
+        "flow_active": not task_complete
     }
 
 #-----------------Agent 3-----------------------
 #-----------------Tool import ------------------
 from customer_complaint import generate_ticket
 rag_retreiver_tool= Rag_tool()
+_COMPLAINT_TOOLS_BY_NAME= {
+    "generate_ticket": generate_ticket
+}
 _complaint_tools = [generate_ticket]
 ticket_llm= model.bind_tools(tools=_complaint_tools)
 def customer_complaint_agent(state:BotState):
@@ -312,20 +304,73 @@ def customer_complaint_agent(state:BotState):
             * Next, you have to get a valid active email from user.
             * After that, you have to ask for phone number from user.
             * Then you need to analyze the problem customer is facing, and write it in the format of complaint so we can later accomodate.
-            After tool call is succesfull, you have to tell user you'll be accomodated within 24 hours."""),
-            MessagesPlaceholder(variable_name="chat_history")
+            After tool call is succesfull, you have to tell user you'll be accomodated within 24 hours.""" + REROUTE_INSTRUCTION,),
+            MessagesPlaceholder(variable_name="chat_history"),
             ("human", "{input}")
          ]
     )
     ticket_agent_chain= prompt | ticket_llm
-    history= state.get("messages", [])
+    history= sanitize_history_for_agent(state.get("messages", [])[:-1])
     current_user_message= state["incoming_message"]
     response= ticket_agent_chain.invoke({"chat_history": history, "input": current_user_message})
+    
+    new_message: list[BaseMessage]= [response]
+    tool_result: list[str] = []
+    while response.tool_calls:
+        tool_messages= []
+        for call in response.tool_calls:
+            tool_fn= _COMPLAINT_TOOLS_BY_NAME[call["name"]]
+            tool_result= tool_fn.invoke(call["args"])
+            tool_messages.append(ToolMessage(content=str(tool_result), tool_call_id=call["id"]))
+        new_message.extend(tool_messages)
+        response= ticket_llm.invoke(history + [HumanMessage(content=current_user_message)] + new_message)
+        new_message.append(response)
+
     answer= extract_text(response)
+    if answer == REROUTE_SENTINEL:
+        return {
+            "messages": [],
+            "response_to_user": "",
+            "flow_active": False,
+        }
+ 
+    task_complete = any("has been logged" in r for r in tool_result)
+ 
     return {
-        "messages": [AIMessage(content=answer)],
-        "response_to_user": answer
+        "messages": new_message,
+        "response_to_user": answer,
+        "flow_active": not task_complete,
     }
+
+# ---------------- Routing ----------------
+def entry_router(
+    state: BotState,
+) -> Literal["classifier_agent", "order_management_agent", "customer_query_agent", "customer_complaint_agent"]:
+    """
+    Sticky routing: if we're mid-task with a known agent, skip reclassification
+    and go straight back to it. Otherwise (fresh conversation, or the previous
+    agent finished/rerouted), reclassify.
+    """
+    if state.get("flow_active") and state.get("classifier"):
+        return f"{state['classifier']}_agent"
+    return "classifier_agent"
+ 
+ 
+def routing_agent(
+    state: BotState,
+) -> Literal["customer_complaint_agent", "customer_query_agent", "order_management_agent"]:
+    if state["classifier"] == "customer_complaint":
+        return "customer_complaint_agent"
+    if state["classifier"] == "customer_query":
+        return "customer_query_agent"
+    return "order_management_agent"
+ 
+ 
+def after_agent_router(state: BotState) -> Literal["classifier_agent", "__end__"]:
+    """If an agent hit the REROUTE sentinel, loop back through the classifier once."""
+    if state.get("response_to_user", "") == "":
+        return "classifier_agent"
+    return END
 
 @app.get("/")
 def health():
@@ -361,27 +406,49 @@ def main_graph():
     
 compiled_graph= main_graph()
 
-@wa.on_message()
-def handle_text_message(client:WhatsApp, message: types.Message):
-    incoming_text= extract_text_message(message)
-    if not incoming_text:
-        message.reply_text("Sorry, I couldn't understand that message. Could you try again?")
-        return 
+from concurrent.futures import ThreadPoolExecutor
+_executer= ThreadPoolExecutor(max_workers=16)
+_processed_message_ids: set[str]= set()
+
+    
+def process_message(message: types.Message, incoming_text: str):
+    """Runs the slow AI pipeline off the webhook request path."""
+    start= time.time()
     wa_id = message.from_user.wa_id
-    config = {"configurable": {"thread_id": str(wa_id)}}
+    config = {"configurable": {"thread_id": str(wa_id)}, "recursion_limit": 15}
+
     try:
-        result= compiled_graph.invoke(
+        result = compiled_graph.invoke(
             {
                 "incoming_message": incoming_text,
-                "wa_id": message.from_user.wa_id,
-                "messages": [HumanMessage(content=incoming_text)]
+                "wa_id": wa_id,
+                "messages": [HumanMessage(content=incoming_text)],
             },
-            config= config,
+            config=config,
         )
-        print("DEBUG RESULT: ", result, flush=True)
-        ai_reply= result.get("response_to_user") or "Sorry, I'm having trouble right now. Please try again in a moment."
-    except Exception as e:
+        ai_reply = result.get("response_to_user") or "Sorry, I didn't quite catch that. Could you rephrase?"
+    except Exception:
         import traceback
         traceback.print_exc()
         ai_reply = "Sorry, I'm having trouble right now. Please try again in a moment."
+    print(f"Processed in {time.time() - start:.2f}s", flush=True)  
     message.reply_text(ai_reply)
+
+
+@wa.on_message()
+def handle_text_message(client: WhatsApp, message: types.Message):
+    if message.id in _processed_message_ids:
+        return
+    _processed_message_ids.add(message.id)
+
+    incoming_text = extract_text_message(message)
+    if not incoming_text:
+        message.reply_text("Sorry, I couldn't understand that message. Could you try again?")
+        return
+
+    try:
+        message.mark_as_read()  # verify exact method name against your pywa version's docs
+    except Exception as e:
+        print(f"mark_as_read failed (non-fatal): {e}")
+ 
+    _executer.submit(process_message, message, incoming_text)
